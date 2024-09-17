@@ -1,0 +1,204 @@
+import nest_asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+import yt_dlp as youtube_dl
+import os
+import logging
+from mega import Mega  # MEGA integration
+import asyncio
+from pathlib import Path
+import libtorrent as lt
+
+# Apply nest_asyncio
+nest_asyncio.apply()
+
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# Constants
+TOKEN = '7273181657:AAEEcT4RyEYfjP9jMFETvRgjLzrP0T-UV1k'
+MEGA_EMAIL = 'wadidchy@gmail.com'
+MEGA_PASSWORD = '#AbdulWadid6893724'
+DOWNLOAD_DIR = "./downloads/"
+
+# Ensure the download directory exists
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Initialize MEGA client
+mega = Mega()
+mega.login(MEGA_EMAIL, MEGA_PASSWORD)
+
+# Welcome Message
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Hello, {user.first_name}! Send me a video URL or a magnet link to download.")
+
+# Button handler to process user choice of video quality
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer(text="Processing your request...")
+
+    # Retrieve the selected quality and URL
+    quality = query.data.split('|')[0]
+    url = query.data.split('|')[1]
+
+    await download_video_file(update, context, url, quality)
+
+# Ask user for their choice: quality (360p, 480p, 720p, 1080p)
+async def ask_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    keyboard = [
+        [
+            InlineKeyboardButton("360p", callback_data=f"360p|{url}"),
+            InlineKeyboardButton("480p", callback_data=f"480p|{url}"),
+        ],
+        [
+            InlineKeyboardButton("720p", callback_data=f"720p|{url}"),
+            InlineKeyboardButton("1080p", callback_data=f"1080p|{url}"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('Choose the video quality:', reply_markup=reply_markup)
+
+# Upload file to MEGA and get the download link
+def upload_to_mega(file_path):
+    file = mega.upload(file_path)
+    return mega.get_upload_link(file)
+
+# Function to create a custom text-based progress bar
+def create_progress_bar(completed, total):
+    bar_length = 40  # Length of the progress bar
+    if total == 0:  # Avoid division by zero
+        progress = 0
+    else:
+        progress = int(bar_length * completed / total)  # Scale to bar_length characters
+    bar = '█' * progress + '-' * (bar_length - progress)
+    percent = (completed / total) * 100 if total != 0 else 0
+    return f"[{bar}] {percent:.1f}% {completed:.2f}/{total:.2f} MB"
+
+# Function to update progress message
+async def update_progress_message(chat_id, message_id, new_text, bot):
+    try:
+        current_message = await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text)
+        if current_message.text == new_text:
+            return  # Do nothing if the message content hasn't changed
+    except Exception as e:
+        logger.error(f"Failed to update progress message: {str(e)}")
+
+# Download video file in the chosen quality
+async def download_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str):
+    ydl_opts = {
+        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
+        'noplaylist': True,
+        'quiet': True,
+        'format': f'bestvideo[height<={quality[:-1]}]+bestaudio/best[height<={quality[:-1]}]'
+    }
+
+    try:
+        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+            # Send initial progress message
+            progress_message = await context.bot.send_message(chat_id=update.effective_chat.id, text="Downloading video, please wait...")
+
+            # Download the video
+            logger.info(f"Downloading video: {url} in {quality}p quality...")
+            ydl.download([url])
+            video_file_path = ydl.prepare_filename(info)
+
+            # Verify if the file exists
+            if not os.path.exists(video_file_path):
+                logger.error(f"Failed to download the video. File not found at: {video_file_path}")
+                await update_progress_message(update.effective_chat.id, progress_message.message_id, "Failed to download the video. File not found.", context.bot)
+                return
+
+            # Always upload to MEGA (skip Telegram upload to avoid size issues)
+            mega_link = upload_to_mega(video_file_path)
+            await update_progress_message(update.effective_chat.id, progress_message.message_id, f"Here is your MEGA download link: {mega_link}", context.bot)
+            os.remove(video_file_path)  # Clean up after sending
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}")
+        await update_progress_message(update.effective_chat.id, progress_message.message_id, f"An error occurred: {str(e)}", context.bot)
+
+# Download torrent file using libtorrent
+async def download_torrent(update: Update, context: ContextTypes.DEFAULT_TYPE, magnet_link: str):
+    try:
+        # Create a libtorrent session
+        ses = lt.session()
+        params = {
+            'save_path': DOWNLOAD_DIR,
+            'storage_mode': lt.storage_mode_t.storage_mode_sparse,
+        }
+
+        # Add the magnet link
+        handle = lt.add_magnet_uri(ses, magnet_link, params)
+
+        # Send initial progress message
+        progress_message = await context.bot.send_message(chat_id=update.effective_chat.id, text="Started downloading the torrent, please wait...")
+
+        # Wait for the torrent to finish downloading
+        while not handle.has_metadata() or not handle.is_seed():
+            # Update the download object
+            s = handle.status()
+
+            # Get progress percentage and size
+            completed = s.total_wanted_done / (1024 * 1024)  # Convert to MB
+            total = s.total_wanted / (1024 * 1024)  # Convert to MB
+
+            # Check if total length is zero to avoid division by zero
+            if total == 0:
+                progress_text = "Calculating progress..."
+            else:
+                progress_text = f"Downloading torrent...\n{create_progress_bar(completed, total)}\n{completed:.2f}/{total:.2f} MB"
+
+            # Update progress message
+            await update_progress_message(update.effective_chat.id, progress_message.message_id, progress_text, context.bot)
+
+            await asyncio.sleep(30)  # Delay between updates
+
+        # Verify downloaded files and send MEGA link
+        torrent_info = handle.get_torrent_info()
+        for file_index in range(torrent_info.num_files()):
+            file_path = Path(DOWNLOAD_DIR) / torrent_info.files()[file_index].path
+            file_path_str = str(file_path)  # Convert Path to string for extension checking
+
+            logger.info(f"Downloaded file: {file_path_str}")
+
+            # Ensure the file is a valid video file and not a metadata file
+            if file_path.exists() and not file_path_str.endswith('[METADATA]'):
+                if file_path_str.endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv')):
+                    mega_link = upload_to_mega(file_path_str)
+                    await update_progress_message(update.effective_chat.id, progress_message.message_id, f"Here is your MEGA download link for {torrent_info.files()[file_index].path}: {mega_link}", context.bot)
+                    os.remove(file_path_str)  # Clean up after sending
+
+        # Notify user if no valid files were found
+        if not any(file_path_str.endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv')) for file_path_str in map(str, [torrent_info.files()[i].path for i in range(torrent_info.num_files())])):
+            await update_progress_message(update.effective_chat.id, progress_message.message_id, "No valid video files found in the torrent.", context.bot)
+    except Exception as e:
+        logger.error(f"An error occurred while downloading torrent: {str(e)}")
+        await update_progress_message(update.effective_chat.id, progress_message.message_id, f"An error occurred: {str(e)}", context.bot)
+
+# Handle messages
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_text = update.message.text
+
+    if message_text.startswith("magnet:"):
+        # Handle magnet link
+        await download_torrent(update, context, message_text)
+    else:
+        # Handle normal video URL
+        await ask_quality(update, context)
+
+if __name__ == '__main__':
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    start_handler = CommandHandler('start', start)
+    message_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
+    button_handler = CallbackQueryHandler(button)
+
+    application.add_handler(start_handler)
+    application.add_handler(message_handler)
+    application.add_handler(button_handler)
+
+    application.runpolling
